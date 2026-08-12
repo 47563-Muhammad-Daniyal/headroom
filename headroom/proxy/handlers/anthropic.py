@@ -290,7 +290,16 @@ class AnthropicHandlerMixin:
             new_content: list[dict[str, Any]] = []
             appended = False
             for block in content:
-                if not appended and isinstance(block, dict) and block.get("type") == "text":
+                if (
+                    not appended
+                    and isinstance(block, dict)
+                    and block.get("type") == "text"
+                    # Never mutate a block carrying the client's cache
+                    # breakpoint: the client re-sends the original bytes
+                    # next turn, so any injection here busts the prefix
+                    # cache at this message from then on.
+                    and "cache_control" not in block
+                ):
                     existing = block.get("text", "")
                     new_content.append({**block, "text": existing + "\n\n" + context_text})
                     appended = True
@@ -735,6 +744,16 @@ class AnthropicHandlerMixin:
                     original_client_messages = copy.deepcopy(messages)
             if input_event.tools is not None:
                 body["tools"] = input_event.tools
+
+            # Snapshot the client's cache_control breakpoints before any
+            # transform runs; paired with the outbound count right before
+            # forwarding (event=cache_breakpoints) so a dropped or moved
+            # final breakpoint is self-diagnosing from proxy.log alone.
+            from headroom.proxy.helpers import count_cache_breakpoints
+
+            inbound_breakpoints = count_cache_breakpoints(
+                body.get("system"), messages, body.get("tools")
+            )
 
             # Validate message array size
             if len(messages) > MAX_MESSAGE_ARRAY_LENGTH:
@@ -1661,12 +1680,19 @@ class AnthropicHandlerMixin:
 
             # Own cache_control placement: the client moves the breakpoint each
             # turn and the overlay replays past markers, so they accumulate ~1/turn
-            # and Anthropic hard-errors at >4. Strip message-level markers and keep
-            # one breakpoint. Pure appends advance it to the newest block; a
-            # proven rewritten tail anchors it at the byte-stable boundary so
-            # that the same prefix is readable next turn. Applied last so the
+            # and Anthropic hard-errors at >4. Strip message-level markers and
+            # re-place them at the CLIENT's current positions: Anthropic resolves
+            # each breakpoint with a ~20-content-block lookback, and the client's
+            # previous-message marker is the read anchor that lets a big turn's
+            # write chain to the prior entry. Collapsing to one newest-block
+            # marker breaks that chain on tool-heavy turns (silent full re-write)
+            # and can leave the tail billing uncached. Applied last so the
             # forwarded AND recorded (next_forwarded) messages stay bounded.
-            _norm = normalize_message_cache_control(optimized_messages, previous_forwarded_messages)
+            _norm = normalize_message_cache_control(
+                optimized_messages,
+                previous_forwarded_messages,
+                client_messages=original_client_messages,
+            )
             if _norm is not optimized_messages:
                 optimized_messages = _norm
 
@@ -2970,6 +2996,16 @@ class AnthropicHandlerMixin:
                         "headroom_retrieve available; using buffered stream:false "
                         "upstream request for server-side retrieval handling"
                     )
+
+                from headroom.proxy.helpers import log_cache_breakpoints
+
+                log_cache_breakpoints(
+                    request_id=request_id,
+                    inbound=inbound_breakpoints,
+                    outbound=count_cache_breakpoints(
+                        body.get("system"), body.get("messages"), body.get("tools")
+                    ),
+                )
 
                 if stream and not buffered_stream_ccr:
                     self.pipeline_extensions.emit(
