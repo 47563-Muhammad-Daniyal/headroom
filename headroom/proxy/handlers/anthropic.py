@@ -2026,7 +2026,10 @@ class AnthropicHandlerMixin:
                 # dropping the gate cannot start injecting into non-CCR
                 # conversations.
                 if configured_inject_tool:
-                    from headroom.proxy.helpers import apply_session_sticky_ccr_tool
+                    from headroom.proxy.helpers import (
+                        apply_session_sticky_ccr_tool,
+                        history_references_ccr_tool,
+                    )
 
                     # Inject whenever the request carries ANY CCR marker, new or
                     # replayed from the frozen prefix. #1850 narrowed the
@@ -2051,6 +2054,7 @@ class AnthropicHandlerMixin:
                         request_id=request_id,
                         existing_tools=tools,
                         has_compressed_content_this_turn=injector.has_compressed_content,
+                        history_has_ccr_reference=history_references_ccr_tool(optimized_messages),
                     )
                     if ccr_tool_injected:
                         logger.debug(
